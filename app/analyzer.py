@@ -5,8 +5,17 @@ Parquet 检查点（``NNN.checkpoint.parquet``）以及现存数据文件的表�
 清单。本模块逐版重放提交 / 检查点，重建每个版本快照仍引用的数据文件，
 再与现存清单核对，判断该版本能否完整重建。
 
+内存设计（容器上限 256 MiB）：
+
+- 逐行 JSON 提交（ndjson）按**流逐行**解析，绝不整份读入内存——旧提交里
+  动辄上百 MiB 的 ``stats`` 列统计只在单行存活，解析完即释放；
+- 重放只保留每个 add 动作的**归一化路径**，``stats`` / ``statsParser`` 等
+  列统计与其余元数据一律不保留；
+- 整体 JSON 数组提交、Parquet 检查点与文件清单仍按原能力支持（数组格式
+  本身体量小，检查点仅投影重放所需列）。
+
 仅支持**不包含删除向量（Deletion Vector）**的表；一旦在协议特性或任意
-add 动作中发现删除向量，立即拒绝分析并提示文件来源。
+add/remove 动作中发现删除向量，立即拒绝分析并提示文件来源。
 """
 
 from __future__ import annotations
@@ -15,8 +24,9 @@ import io
 import json
 import re
 import urllib.parse
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Iterator
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -27,6 +37,9 @@ _COMMIT_RE = re.compile(r"^(\d{20})\.json$")
 _CHECKPOINT_RE = re.compile(r"^(\d{20})\.checkpoint\.parquet$")
 # 多文件（分片）检查点，本工具不支持，仅登记并忽略
 _MULTI_CHECKPOINT_RE = re.compile(r"^\d{20}\.checkpoint\.\d+\.\d+\.parquet$")
+
+# UTF-8 BOM：出现在文件首行开头时跳过
+_BOM = b"\xef\xbb\xbf"
 
 DV_FEATURE_NAME = "deletionVectors"
 
@@ -41,17 +54,47 @@ class AnalyzerError(Exception):
 
 @dataclass
 class InputFile:
-    """一次上传的文件（文件名 + 已读入内存的字节）。"""
+    """一次上传的文件。
+
+    三种承载方式任选其一：
+
+    - ``data``：小文件的字节串（测试与本地样例使用）；
+    - ``stream``：已打开的二进制可读流（网页上传，指向假脱机临时文件，
+      调用方负责其生命周期）；
+    - ``path``：服务器本地文件路径（内置样例使用，按需打开）。
+    """
 
     filename: str
-    data: bytes
+    data: bytes | None = None
+    stream: Any = None
+    path: Any = None
+
+    @contextmanager
+    def open(self) -> Iterator[Any]:
+        """打开一个从头开始的二进制流（退出时关闭本对象自建的流）。"""
+        if self.data is not None:
+            yield io.BytesIO(self.data)
+            return
+        if self.stream is not None:
+            self.stream.seek(0)
+            yield self.stream
+            return
+        if self.path is not None:
+            fh = open(self.path, "rb")
+            try:
+                yield fh
+            finally:
+                fh.close()
+            return
+        raise AnalyzerError(f"输入文件 {self.filename} 没有任何可读内容")
 
 
 @dataclass
 class ParsedCommit:
     version: int
     source: str
-    adds: list[tuple[str, dict]] = field(default_factory=list)
+    # 重放只需要路径；add 动作里的 stats 等列统计一律不保留
+    adds: list[str] = field(default_factory=list)
     removes: list[str] = field(default_factory=list)
     dv_detected: bool = False
     protocol_features: list[str] = field(default_factory=list)
@@ -84,46 +127,68 @@ def normalize_data_path(raw: Any) -> str:
     return urllib.parse.unquote(path)
 
 
-def _decode_utf8(data: bytes, source: str) -> str:
+def _read_first_content_line(fh: Any) -> tuple[bytes, int] | None:
+    """读到首个非空行，返回（去掉 BOM 的行内容、累计物理行数）。"""
+    line_no = 0
+    while True:
+        line = fh.readline()
+        if not line:
+            return None
+        line_no += 1
+        if line_no == 1 and line.startswith(_BOM):
+            line = line[len(_BOM):]
+        if line.strip():
+            return line, line_no
+
+
+def _parse_json_array_commit(fh: Any, source: str,
+                             first_line: bytes) -> list[dict]:
+    """整体 JSON 数组提交（体量小的旧格式）：整份解析，逐动作处理。"""
+    raw = first_line + fh.read()
     try:
-        return data.decode("utf-8")
+        whole = json.loads(raw.decode("utf-8"))
     except UnicodeDecodeError as exc:
         raise AnalyzerError(f"{source} 不是合法的 UTF-8 文本：{exc}") from exc
-
-
-def _iter_json_objects(text: str, source: str):
-    """Delta 提交是 ndjson（每行一个动作对象），同时兼容整体 JSON 数组。"""
-    stripped = text.strip()
-    if not stripped:
-        return
-    # 先完整解析 ndjson；整行恰好是 JSON 数组 / 对象，或任意行失败则整体回退，
-    # 避免把单行 JSON 数组误当成 ndjson、或吐出半截动作
-    line_objs = []
-    ndjson_ok = True
-    for line in stripped.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            ndjson_ok = False
-            break
-        if not isinstance(obj, dict):
-            ndjson_ok = False
-            break
-        line_objs.append(obj)
-    if ndjson_ok and line_objs:
-        yield from line_objs
-        return
-    try:
-        whole = json.loads(stripped)
     except json.JSONDecodeError as exc:
-        raise AnalyzerError(f"{source} 既不是 ndjson 也不是合法 JSON：{exc}") from exc
-    if isinstance(whole, list):
-        yield from whole
-    else:
-        yield whole
+        raise AnalyzerError(f"{source} 不是合法 JSON：{exc}") from exc
+    if not isinstance(whole, list):
+        raise AnalyzerError(
+            f"{source} 是整体 JSON 但顶层不是动作数组，无法作为 Delta 提交"
+        )
+    return [obj for obj in whole if isinstance(obj, dict)]
+
+
+def _parse_ndjson_line(line: bytes, line_no: int, source: str) -> dict:
+    try:
+        obj = json.loads(line)
+    except json.JSONDecodeError as exc:
+        # 即使坏行出现在提交末尾，也在这里直接拒绝、不产生任何核查结果
+        raise AnalyzerError(
+            f"{source} 第 {line_no} 行不是合法 JSON，无法解析该提交：{exc}"
+        ) from exc
+    if not isinstance(obj, dict):
+        raise AnalyzerError(
+            f"{source} 第 {line_no} 行的动作不是 JSON 对象，无法作为 Delta 提交"
+        )
+    return obj
+
+
+def _iter_ndjson(fh: Any, source: str, first_line: bytes,
+                 first_line_no: int) -> Iterator[dict]:
+    """逐行流式解析 ndjson 提交，首个非空行由调用方预先读出。"""
+    yield _parse_ndjson_line(first_line, first_line_no, source)
+    line_no = first_line_no
+    while True:
+        try:
+            line = fh.readline()
+        except UnicodeDecodeError as exc:
+            raise AnalyzerError(f"{source} 不是合法的 UTF-8 文本：{exc}") from exc
+        if not line:
+            return
+        line_no += 1
+        if not line.strip():
+            continue
+        yield _parse_ndjson_line(line, line_no, source)
 
 
 def _extract_protocol_features(protocol: dict) -> list[str]:
@@ -135,47 +200,74 @@ def _extract_protocol_features(protocol: dict) -> list[str]:
     return features
 
 
-def _add_has_dv(add_action: dict) -> bool:
-    dv = add_action.get("deletionVector")
-    return dv is not None
+def _apply_commit_action(obj: dict, parsed: ParsedCommit) -> None:
+    """从单个动作对象提取重放所需信息；列统计等元数据在此即被丢弃。"""
+    add = obj.get("add")
+    if isinstance(add, dict):
+        parsed.adds.append(normalize_data_path(add.get("path")))
+        if add.get("deletionVector") is not None:
+            parsed.dv_detected = True
+
+    remove = obj.get("remove")
+    if isinstance(remove, dict):
+        parsed.removes.append(normalize_data_path(remove.get("path")))
+        if remove.get("deletionVector") is not None:
+            parsed.dv_detected = True
+
+    protocol = obj.get("protocol")
+    if isinstance(protocol, dict):
+        parsed.protocol_features.extend(_extract_protocol_features(protocol))
 
 
-def parse_commit(version: int, data: bytes, source: str) -> ParsedCommit:
-    """解析一个 JSON 提交文件。"""
-    parsed = ParsedCommit(version=version, source=source)
-    text = _decode_utf8(data, source)
-    for obj in _iter_json_objects(text, source):
-        if not isinstance(obj, dict):
-            continue
-        if "add" in obj and isinstance(obj["add"], dict):
-            add = obj["add"]
-            path = normalize_data_path(add.get("path"))
-            parsed.adds.append((path, add))
-            if _add_has_dv(add):
-                parsed.dv_detected = True
-        if "remove" in obj and isinstance(obj["remove"], dict):
-            remove = obj["remove"]
-            parsed.removes.append(normalize_data_path(remove.get("path")))
-            if remove.get("deletionVector") is not None:
-                parsed.dv_detected = True
-        if "protocol" in obj and isinstance(obj["protocol"], dict):
-            parsed.protocol_features.extend(
-                _extract_protocol_features(obj["protocol"])
-            )
+def parse_commit(version: int, item: InputFile) -> ParsedCommit:
+    """解析一个 JSON 提交文件（ndjson 流式；整体 JSON 数组仍支持）。"""
+    parsed = ParsedCommit(version=version, source=item.filename)
+    with item.open() as fh:
+        try:
+            head = _read_first_content_line(fh)
+            if head is None:
+                return parsed
+            first_line, first_line_no = head
+            # 用首个非空行的首字符区分整体 JSON 数组与逐行 ndjson
+            if first_line.lstrip()[:1] == b"[":
+                actions = _parse_json_array_commit(
+                    fh, item.filename, first_line)
+            else:
+                actions = _iter_ndjson(
+                    fh, item.filename, first_line, first_line_no)
+            for obj in actions:
+                _apply_commit_action(obj, parsed)
+        except AnalyzerError:
+            raise
+        except UnicodeDecodeError as exc:
+            raise AnalyzerError(
+                f"{item.filename} 不是合法的 UTF-8 文本：{exc}"
+            ) from exc
     return parsed
 
 
-def parse_checkpoint(version: int, data: bytes, source: str) -> ParsedCheckpoint:
-    """用 PyArrow 解析经典单文件 Parquet 检查点。"""
-    parsed = ParsedCheckpoint(version=version, source=source)
-    try:
-        table = pq.read_table(io.BytesIO(data))
-    except Exception as exc:  # parquet 损坏 / 非 parquet
-        raise AnalyzerError(f"{source} 无法作为 Parquet 检查点读取：{exc}") from exc
+def parse_checkpoint(version: int, item: InputFile) -> ParsedCheckpoint:
+    """用 PyArrow 解析经典单文件 Parquet 检查点（只投影重放所需列）。"""
+    parsed = ParsedCheckpoint(version=version, source=item.filename)
+    with item.open() as fh:
+        try:
+            # 先看 schema 再只投影重放所需列，缺列的检查点也能读
+            available = set(pq.ParquetFile(fh).schema_arrow.names)
+            wanted = [c for c in ("add", "remove", "protocol") if c in available]
+            if "add" not in wanted:
+                raise AnalyzerError(
+                    f"{item.filename} 中缺少 add 列，不是合法的 Delta 检查点"
+                )
+            fh.seek(0)
+            table = pq.read_table(fh, columns=wanted)
+        except AnalyzerError:
+            raise
+        except Exception as exc:  # parquet 损坏 / 非 parquet
+            raise AnalyzerError(
+                f"{item.filename} 无法作为 Parquet 检查点读取：{exc}"
+            ) from exc
 
     column_names = set(table.column_names)
-    if "add" not in column_names:
-        raise AnalyzerError(f"{source} 中缺少 add 列，不是合法的 Delta 检查点")
 
     # Table.column 返回 ChunkedArray，需 combine_chunks 后才能按 struct 取子字段
     add_col = table.column("add").combine_chunks()
@@ -220,18 +312,31 @@ def parse_checkpoint(version: int, data: bytes, source: str) -> ParsedCheckpoint
     return parsed
 
 
-def parse_manifest(data: bytes, source: str) -> set[str]:
-    """解析现存数据文件相对路径清单（每行一个路径）。"""
-    text = _decode_utf8(data, source)
+def parse_manifest(item: InputFile) -> set[str]:
+    """解析现存数据文件相对路径清单（每行一个路径，流式读取）。"""
     existing: set[str] = set()
-    for line_no, line in enumerate(text.splitlines(), start=1):
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        try:
-            existing.add(normalize_data_path(line))
-        except AnalyzerError as exc:
-            raise AnalyzerError(f"{source} 第 {line_no} 行：{exc}") from exc
+    with item.open() as fh:
+        line_no = 0
+        while True:
+            line = fh.readline()
+            if not line:
+                break
+            line_no += 1
+            try:
+                text = line.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise AnalyzerError(
+                    f"{item.filename} 第 {line_no} 行不是合法 UTF-8：{exc}"
+                ) from exc
+            text = text.strip()
+            if not text or text.startswith("#"):
+                continue
+            try:
+                existing.add(normalize_data_path(text))
+            except AnalyzerError as exc:
+                raise AnalyzerError(
+                    f"{item.filename} 第 {line_no} 行：{exc}"
+                ) from exc
     return existing
 
 
@@ -250,13 +355,13 @@ def _classify_logs(log_files: list[InputFile]):
             if version in commits:
                 duplicate.append(name)
                 continue
-            commits[version] = parse_commit(version, item.data, name)
+            commits[version] = parse_commit(version, item)
         elif m_ckpt:
             version = int(m_ckpt.group(1))
             if version in checkpoints:
                 duplicate.append(name)
                 continue
-            checkpoints[version] = parse_checkpoint(version, item.data, name)
+            checkpoints[version] = parse_checkpoint(version, item)
         elif _MULTI_CHECKPOINT_RE.match(name):
             ignored.append({"name": name,
                             "reason": "分片（多文件）检查点，本工具仅支持经典单文件检查点"})
@@ -269,7 +374,7 @@ def _classify_logs(log_files: list[InputFile]):
 
 def _guard_deletion_vectors(commits: dict[int, ParsedCommit],
                             checkpoints: dict[int, ParsedCheckpoint]) -> None:
-    for version, parsed in sorted(commits.items()):
+    for _version, parsed in sorted(commits.items()):
         if DV_FEATURE_NAME in parsed.protocol_features:
             raise AnalyzerError(
                 f"表启用了删除向量：提交 {parsed.source} 的 protocol 特性包含 "
@@ -280,7 +385,7 @@ def _guard_deletion_vectors(commits: dict[int, ParsedCommit],
                 f"表包含删除向量：提交 {parsed.source} 的 add/remove 动作带有 "
                 f"deletionVector 字段。本工具只处理无删除向量的表。"
             )
-    for version, parsed in sorted(checkpoints.items()):
+    for _version, parsed in sorted(checkpoints.items()):
         if DV_FEATURE_NAME in parsed.protocol_features:
             raise AnalyzerError(
                 f"表启用了删除向量：检查点 {parsed.source} 的 protocol 特性包含 "
@@ -338,7 +443,7 @@ def _replay(target: int,
         base_label = f"checkpoint-{base_version}"
     else:
         seed = commits[0]
-        for path, meta in seed.adds:
+        for path in seed.adds:
             active[path] = {"from": "commit-0"}
         required_commits = range(1, target + 1)
         base_label = "commit-0"
@@ -351,7 +456,7 @@ def _replay(target: int,
         # 同一提交内按文件中的动作顺序应用；remove 先于 add 生效
         for path in commit.removes:
             active.pop(path, None)
-        for path, meta in commit.adds:
+        for path in commit.adds:
             active[path] = {"from": f"commit-{version}"}
 
     return {
@@ -390,7 +495,7 @@ def analyze(log_files: list[InputFile],
     manifest_names: list[str] = []
     for item in manifest_files:
         manifest_names.append(item.filename.rsplit("/", 1)[-1])
-        existing |= parse_manifest(item.data, item.filename)
+        existing |= parse_manifest(item)
 
     version_reports = []
     summary = {STATUS_RECOVERABLE: 0,

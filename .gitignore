@@ -3,3 +3,5 @@ __pycache__/
 .pytest_cache/
 .venv/
 venv/
+# 大日志压力材料由 scripts/generate_large_log.py 按需生成（约 200 MiB）
+samples_large/

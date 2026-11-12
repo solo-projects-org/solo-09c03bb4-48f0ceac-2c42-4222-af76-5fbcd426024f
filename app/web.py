@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import os
+import tempfile
 from pathlib import Path
 
 from flask import Flask, jsonify, render_template, request
@@ -15,7 +16,13 @@ from flask import Flask, jsonify, render_template, request
 from .analyzer import AnalyzerError, InputFile, analyze
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 256 * 1024 * 1024  # 单次请求上限 256MB
+# 单次请求上限 512MB：约 192MiB 的逐行提交与其他材料一起上传时不会被 413 拦截；
+# 真正的内存约束由 docker-compose 的 256 MiB 容器限额与流式解析保证，
+# 上传内容始终假脱机（spool）到磁盘，不整份驻留内存。
+app.config["MAX_CONTENT_LENGTH"] = 512 * 1024 * 1024
+
+# 内存中最多保留 1 MiB，超出即落临时文件；256 MiB 容器里绝不能把上传体留在内存
+_SPOOL_THRESHOLD = 1024 * 1024
 
 SAMPLE_ROOT = Path(os.environ.get("SAMPLE_ROOT",
                                   Path(__file__).resolve().parent.parent / "samples"))
@@ -33,13 +40,24 @@ SAMPLES = {
 }
 
 
+def _spool_upload(storage) -> InputFile:
+    """把一个上传字段流式落盘为假脱机临时文件，避免整份读入内存。"""
+    spool = tempfile.SpooledTemporaryFile(max_size=_SPOOL_THRESHOLD, mode="w+b")
+    while True:
+        chunk = storage.stream.read(1024 * 1024)
+        if not chunk:
+            break
+        spool.write(chunk)
+    spool.seek(0)
+    return InputFile(filename=storage.filename, stream=spool)
+
+
 def _read_uploads(field_name: str) -> list[InputFile]:
     files = []
     for storage in request.files.getlist(field_name):
         if not storage or storage.filename == "":
             continue
-        files.append(InputFile(filename=storage.filename,
-                               data=storage.read()))
+        files.append(_spool_upload(storage))
     return files
 
 
@@ -107,12 +125,12 @@ def analyze_sample(sample_name: str):
         log_files = []
         for path in sorted(log_dir.iterdir()):
             if path.is_file():
-                log_files.append(InputFile(filename=path.name,
-                                           data=path.read_bytes()))
+                # 样例走文件路径，按需打开、按需读取，不预先读入内存
+                log_files.append(InputFile(filename=path.name, path=path))
         manifest_path = sample_dir / "existing_files.txt"
         manifest_files = [InputFile(
             filename=manifest_path.name,
-            data=manifest_path.read_bytes(),
+            path=manifest_path,
         )]
         report = _run_analysis(log_files, manifest_files,
                                from_version, to_version)
@@ -126,7 +144,7 @@ def analyze_sample(sample_name: str):
 @app.errorhandler(413)
 def too_large(_err):
     return render_template("index.html", samples=SAMPLES,
-                           error="上传内容超过 256MB 上限"), 413
+                           error="上传内容超过 512MB 上限"), 413
 
 
 if __name__ == "__main__":

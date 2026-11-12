@@ -17,16 +17,46 @@
 **仅处理无删除向量（Deletion Vector）的表**：协议特性或任何 add/remove
 动作中出现 `deletionVector` 时直接拒绝分析，并指出来源文件。
 
+## 大日志与 256 MiB 内存约束
+
+容器通过 Docker Compose 硬限 **256 MiB 内存**（`mem_limit` /
+`memswap_limit`，含 swap 也不放宽）。备份找回的旧提交可能是上百 MiB 的
+逐行 JSON，体积主要来自大量 add 动作内嵌的列统计（`stats` /
+`statsParser`）。为在限额内完成核查：
+
+- **接收不落内存**：上传体按 1 MiB 分块假脱机（spool）到临时文件，
+  网页进程从不把整个请求读进内存；
+- **逐行流式解析**：ndjson 提交按行读取，单行解析完即释放，列统计
+  只在单行短暂存活；整体 JSON 数组提交仍按原方式支持（该格式体量小）；
+- **重放不保留列统计**：`ParsedCommit` 只存归一化后的文件路径，
+  `stats` / `statsParser` 等元数据在解析时即丢弃；
+- **检查点按需投影**：Parquet 检查点只读取 `add` / `remove` /
+  `protocol` 三列，且按文件实际 schema 选择，缺列也能读；
+- **坏行 / 删除向量在末尾也拦截**：即使问题出现在提交最后一行，也会
+  点名来源文件并返回 400，不渲染任何版本核查结果。
+
+`scripts/generate_large_log.py` 生成可直接在网页上传的压力材料
+（默认 `samples_large/orders_table/`）：约 192 MiB 的 v0 逐行提交
+（数千个带大列统计的 add）+ 一个把快照收敛到 5 个文件的 v1 提交 +
+现存文件清单。上传两份提交与清单、版本区间填 **1–1**，应在 256 MiB
+限额内得到“可重建 · 文件齐全”。
+
+```bash
+python -I scripts/generate_large_log.py                 # 默认 192 MiB
+python -I scripts/generate_large_log.py --target-mib 64 # 自定义体积
+```
+
 ## 目录结构
 
 ```
 app/
-  analyzer.py            # 核心逻辑：日志解析、逐版重放、文件核对、DV 拦截
-  web.py                 # Flask 路由：上传分析 + 本地样例 API
+  analyzer.py            # 核心逻辑：流式日志解析、逐版重放、文件核对、DV 拦截
+  web.py                 # Flask 路由：上传假脱机 + 分析、本地样例 API
   templates/index.html   # 单页界面（服务端渲染与 JS 渲染共用）
-scripts/generate_samples.py  # 用 PyArrow 构造两套样例 Delta 表
+scripts/generate_samples.py      # 用 PyArrow 构造两套样例 Delta 表
+scripts/generate_large_log.py    # 生成约 192 MiB 逐行提交压力材料
 samples/                 # 本地样例（健康表 / 误删事故表）
-tests/                   # pytest：27 个核心逻辑与路由测试
+tests/                   # pytest：核心逻辑与路由测试（含大日志内存用例）
 Dockerfile / docker-compose.yml
 ```
 
@@ -36,6 +66,10 @@ Dockerfile / docker-compose.yml
 docker compose up --build
 # 打开 http://localhost:8000
 ```
+
+容器内存硬限 256 MiB（`docker-compose.yml` 的 `mem_limit` /
+`memswap_limit`），Gunicorn 采用单 worker + 4 线程，配合流式解析与
+上传假脱机，在该限额内即可处理约 192 MiB 的逐行提交。
 
 页面下半部有两个按钮可**直接加载本地样例**，无需手动选择文件：
 
@@ -80,6 +114,9 @@ python -I -m pytest tests -q
 
 ## 设计取舍
 
+- **流式优先、只留路径**：逐行提交按行解析、上传体假脱机到磁盘，
+  重放状态里只保留文件路径，列统计（`stats` / `statsParser`）与其余
+  add/remove 元数据一律不保留，确保 256 MiB 限额内可处理上百 MiB 提交；
 - **基线选择**：优先使用不晚于目标版本的最新检查点（重放距离最短），
   无检查点时才要求版本 0 的提交；
 - **逐版独立重放**：每个目标版本都从基线完整重放一次，缺提交不会污染
@@ -87,4 +124,5 @@ python -I -m pytest tests -q
 - **只认经典单文件检查点**：分片检查点（`N.checkpoint.K.M.parquet`）
   与 `_last_checkpoint` 指针不参与重放，只在页面登记忽略原因；
 - **DV 硬拦截**：删除向量会让“文件存在 ≠ 行数据完整”，超出本工具
-  基于文件清单的核对能力，因此在协议层和动作层双重检测并拒绝。
+  基于文件清单的核对能力，因此在协议层和动作层双重检测并拒绝，
+  即使问题动作位于提交末尾也会点名文件且不输出核查结果。

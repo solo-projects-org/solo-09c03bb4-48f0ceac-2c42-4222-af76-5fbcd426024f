@@ -18,5 +18,7 @@ RUN python -I scripts/generate_samples.py
 
 EXPOSE 8000
 
-# 超时放宽到 10 分钟，给大检查点解析留足时间
-CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "2", "--timeout", "600", "app.web:app"]
+# 容器硬限 256 MiB：单 worker（多线程）避免两份 PyArrow 常驻内存；
+# 大提交按行流式解析，上传体假脱机到磁盘，不依赖多进程扩容。
+# 超时放宽到 10 分钟，给逐行解析大日志留足时间。
+CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "1", "--threads", "4", "--timeout", "600", "app.web:app"]

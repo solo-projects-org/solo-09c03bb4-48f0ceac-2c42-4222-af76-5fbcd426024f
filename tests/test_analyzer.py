@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import io
 import json
+from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -23,6 +24,7 @@ from app.analyzer import (
     normalize_data_path,
     parse_checkpoint,
     parse_commit,
+    parse_manifest,
 )
 
 
@@ -114,18 +116,102 @@ def test_normalize_data_path():
 
 
 def test_parse_commit_handles_ndjson_and_array():
-    nd = parse_commit(0, b'{"add": {"path": "a.parquet"}}\n{"remove": {"path": "b.parquet"}}',
-                      "x.json")
-    assert nd.adds == [("a.parquet", {"path": "a.parquet"})]
+    nd = parse_commit(0, InputFile(
+        "x.json",
+        data=b'{"add": {"path": "a.parquet"}}\n{"remove": {"path": "b.parquet"}}'))
+    assert nd.adds == ["a.parquet"]
     assert nd.removes == ["b.parquet"]
 
-    arr = parse_commit(1, b'[{"add": {"path": "c.parquet"}}]', "y.json")
-    assert arr.adds[0][0] == "c.parquet"
+    arr = parse_commit(1, InputFile("y.json",
+                                    data=b'[{"add": {"path": "c.parquet"}}]'))
+    assert arr.adds == ["c.parquet"]
+
+
+def test_parse_commit_accepts_stream_and_path(tmp_path):
+    payload = b'{"add": {"path": "data/a.parquet"}}\n'
+    # 二进制流承载（网页上传路径）
+    via_stream = parse_commit(0, InputFile("s.json", stream=io.BytesIO(payload)))
+    assert via_stream.adds == ["data/a.parquet"]
+    # 本地文件路径承载（样例 API 路径）
+    p = tmp_path / "00000000000000000000.json"
+    p.write_bytes(payload)
+    via_path = parse_commit(0, InputFile(p.name, path=Path(p)))
+    assert via_path.adds == ["data/a.parquet"]
+
+
+def test_parse_commit_strips_column_stats_and_keeps_only_paths():
+    fat = {"add": {"path": "data/fat.parquet", "size": 1,
+                   "stats": '{"numRecords":999,"columnStats":{"x":{"min":"'
+                            + "z" * 4096 + '"}}}',
+                   "statsParser": {"parsedStatsStruct": {"x": {"min": "v"}}}}}
+    parsed = parse_commit(0, InputFile("0.json", data=json.dumps(fat).encode()))
+    assert parsed.adds == ["data/fat.parquet"]
+    # 重放结构里不允许残留任何列统计内容
+    assert not hasattr(parsed, "stats")
+    assert "z" * 64 not in json.dumps(parsed.__dict__)
+
+
+def test_parse_commit_bad_line_at_end_is_rejected_with_filename():
+    good = b'{"add": {"path": "data/a.parquet"}}\n'
+    # 坏行出现在提交末尾，也必须明确指出文件且不产生核查结果
+    bad_tail = good + b"{this is not valid json,,}\n"
+    with pytest.raises(AnalyzerError, match=r"000.*\.json"):
+        parse_commit(0, InputFile("00000000000000000000.json", data=bad_tail))
+    # 分析入口同样直接拒绝，不返回任何版本报告
+    with pytest.raises(AnalyzerError, match="第 2 行"):
+        analyze([InputFile("00000000000000000000.json", data=bad_tail)],
+                [manifest([])], 0, 0)
+
+
+def test_parse_commit_empty_and_whitespace_only():
+    assert parse_commit(0, InputFile("e.json", data=b"")).adds == []
+    assert parse_commit(0, InputFile("w.json", data=b"  \n\t\n")).adds == []
+
+
+def test_parse_commit_dv_at_end_of_file_rejected_with_filename():
+    dv = {"storageType": "u", "pathOrInlineDv": "abc"}
+    tail = ("\n" * 50) + json.dumps({"add": {"path": "data/late.parquet",
+                                             "deletionVector": dv}})
+    with pytest.raises(AnalyzerError, match="删除向量"):
+        analyze([InputFile("00000000000000000000.json", data=tail.encode())],
+                [manifest([])], 0, 0)
+
+
+def test_parse_commit_does_not_read_whole_stream_into_memory(monkeypatch):
+    # 构造一份流式提交：若实现偷懒整份 read()，这里直接失败
+    class TrackingStream(io.BytesIO):
+        def __init__(self, payload):
+            super().__init__(payload)
+            self.max_read = 0
+
+        def read(self, n=-1):
+            if n is None or n < 0:
+                raise AssertionError("提交解析不允许整份 read()，必须逐行流式读取")
+            self.max_read = max(self.max_read, n)
+            return super().read(n)
+
+    payload = b"".join(
+        json.dumps({"add": {"path": f"data/p{i}.parquet",
+                            "stats": "x" * 2048}}).encode() + b"\n"
+        for i in range(50))
+    stream = TrackingStream(payload)
+    parsed = parse_commit(0, InputFile("big.json", stream=stream))
+    assert parsed.adds == [f"data/p{i}.parquet" for i in range(50)]
+    assert stream.max_read <= 8192  # 只允许有界小块读取
+
+
+def test_parse_manifest_streams_lines(tmp_path):
+    p = tmp_path / "existing_files.txt"
+    p.write_text("# comment\n\ndata/a.parquet\n./data/b.parquet\n")
+    existing = parse_manifest(InputFile(p.name, path=Path(p)))
+    assert existing == {"data/a.parquet", "data/b.parquet"}
+    with pytest.raises(AnalyzerError, match="第 2 行"):
+        parse_manifest(InputFile("m.txt", data=b"# ok\nbad-\xff\xfe\n"))
 
 
 def test_parse_checkpoint_basic():
     ck = checkpoint_file(2, [f(0), f(2)], tombstones=[f(1)])
-    parsed = parse_checkpoint(2, ck.data, ck.filename)
+    parsed = parse_checkpoint(2, ck)
     assert parsed.adds == [f(0), f(2)]
     assert parsed.tombstones == [f(1)]
     assert parsed.dv_detected is False
@@ -133,7 +219,8 @@ def test_parse_checkpoint_basic():
 
 def test_bad_parquet_rejected():
     with pytest.raises(AnalyzerError):
-        parse_checkpoint(1, b"not parquet", "00000000000000000001.checkpoint.parquet")
+        parse_checkpoint(1, InputFile(
+            "00000000000000000001.checkpoint.parquet", data=b"not parquet"))
 
 
 # ---------- 完整分析：仅提交 ----------
@@ -309,3 +396,71 @@ def test_no_manifest_means_every_referenced_file_is_missing():
     assert v2["status"] == STATUS_MISSING_FILES
     assert v2["missing_files"] == sorted([f(0), f(2), f(3)])
     assert report["existing_file_count"] == 0
+
+
+# ---------- 大体积逐行提交：流式、丢弃列统计、内存有界 ----------
+
+def _fat_commit_payload(n_adds: int, line_bytes: int = 12 * 1024) -> bytes:
+    """构造体积主要来自 add 列统计的逐行提交字节（约 n_adds * line_bytes）。"""
+    buf = io.BytesIO()
+    buf.write(json.dumps({"protocol": {"minReaderVersion": 1,
+                                       "minWriterVersion": 2}}).encode())
+    buf.write(b"\n")
+    for i in range(1, n_adds + 1):
+        action = {
+            "add": {
+                "path": f"data/part-{i:05d}.parquet",
+                "dataChange": True,
+                "stats": json.dumps({
+                    "numRecords": i,
+                    "columnStats": {"c": {"min": "m" * line_bytes}},
+                }),
+            }
+        }
+        buf.write(json.dumps(action, separators=(",", ":")).encode())
+        buf.write(b"\n")
+    return buf.getvalue()
+
+
+def test_large_ndjson_commit_memory_bounded_and_stats_dropped():
+    # 约 24 MiB 的逐行提交，全部 add 都带大列统计
+    payload = _fat_commit_payload(2048)
+    assert len(payload) > 20 * 1024 * 1024
+
+    import resource
+    rss_before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    # 用假脱机文件承载，模拟网页上传（大对象不落内存）
+    spool = io.BytesIO(payload)
+    v0 = InputFile("00000000000000000000.json", stream=spool)
+
+    # v1 只保留前 2 个文件、新增 2 个；快照引用文件很少
+    v1_actions = [{"remove": {"path": f"data/part-{i:05d}.parquet"}}
+                  for i in range(3, 2049)]
+    v1_actions += [{"add": {"path": f"data/part-{i:05d}.parquet"}}
+                   for i in (2049, 2050)]
+    v1 = InputFile("00000000000000000001.json",
+                   data=("\n".join(json.dumps(a) for a in v1_actions)).encode())
+    kept = [f"data/part-{i:05d}.parquet" for i in (1, 2, 2049, 2050)]
+    manifest_file = InputFile("existing_files.txt",
+                              data=("\n".join(kept) + "\n").encode())
+
+    report = analyze([v0, v1], [manifest_file], 1, 1)
+    v1_report = report["versions"][0]
+    assert v1_report["status"] == STATUS_RECOVERABLE
+    assert v1_report["referenced_file_count"] == 4
+    assert v1_report["missing_files"] == []
+
+    # 重放结构里绝不能残留列统计字符串
+    dumped = json.dumps(report)
+    assert "columnStats" not in dumped and '"min"' not in dumped
+
+    # 峰值 RSS 增长应远小于提交体积（整份读入至少会多出 ~24 MiB）
+    rss_after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    assert rss_after - rss_before < 16 * 1024  # KB：允许 16 MiB 波动
+
+
+def test_large_ndjson_bad_tail_rejected_before_report():
+    payload = _fat_commit_payload(512) + b"{broken json at file tail\n"
+    with pytest.raises(AnalyzerError, match="00000000000000000000.json"):
+        analyze([InputFile("00000000000000000000.json",
+                           stream=io.BytesIO(payload))], [], 0, 0)
